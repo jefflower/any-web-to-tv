@@ -1,9 +1,13 @@
 package com.jefflower.anywebtotv.web
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -42,6 +46,23 @@ class TabManager(
         container.addView(wv)
 
         wv.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
+                handleUrl(view, request.url.toString())
+
+            @Deprecated("Required for API < 24")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
+                handleUrl(view, url)
+
+            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                // Suppress the ugly system error page for unknown-scheme main-frame nav,
+                // which can leak through on some Chromium builds despite shouldOverrideUrlLoading.
+                if (request.isForMainFrame && error.errorCode == ERROR_UNSUPPORTED_SCHEME) {
+                    view.stopLoading()
+                    return
+                }
+                super.onReceivedError(view, request, error)
+            }
+
             override fun onPageFinished(view: WebView, finishedUrl: String) {
                 tab.url = finishedUrl
                 view.title?.let {
@@ -91,6 +112,36 @@ class TabManager(
                          else currentIndex
             switchTo(newIdx)
         }
+    }
+
+    private fun handleUrl(view: WebView, url: String): Boolean {
+        val lower = url.lowercase()
+        // Standard schemes: let WebView load them
+        if (lower.startsWith("http://") || lower.startsWith("https://") ||
+            lower.startsWith("about:") || lower.startsWith("data:") ||
+            lower.startsWith("javascript:") || lower.startsWith("file://") ||
+            lower.startsWith("blob:")) return false
+
+        // Custom scheme (deep link, e.g. baiduboxapp://, bilibili://, weixin://, intent://)
+        // 1) Try to launch a real Android app that handles it.
+        // 2) If none, look for an intent:// fallback URL and load that in WebView.
+        // 3) Otherwise, swallow silently — never show ERR_UNKNOWN_URL_SCHEME.
+        runCatching {
+            val intent = if (lower.startsWith("intent://")) {
+                Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
+            } else {
+                Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            }.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+
+            if (intent.resolveActivity(ctx.packageManager) != null) {
+                ctx.startActivity(intent)
+            } else {
+                intent.getStringExtra("browser_fallback_url")?.let { fallback ->
+                    view.loadUrl(fallback)
+                }
+            }
+        }
+        return true
     }
 
     fun current(): Tab? = tabs.getOrNull(currentIndex)
