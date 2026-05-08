@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg_dark">#FF101218</color>
+    <color name="bg_panel">#FF1B1F2A</color>
+    <color name="bg_tile">#FF252A38</color>
+    <color name="bg_tile_focus">#FF3D6BFF</color>
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#B3FFFFFF</color>
+    <color name="accent">#FF3D6BFF</color>
+    <color name="overlay_dim">#CC000000</color>
+</resources>

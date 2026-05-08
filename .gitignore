@@ -1,0 +1,33 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+!.idea/codeStyles/
+*.iml
+.DS_Store
+captures/
+
+# Local config
+local.properties
+
+# Generated files
+bin/
+gen/
+out/
+.cxx/
+
+# Signing
+*.jks
+*.keystore
+key.properties
+
+# Logs / dumps
+*.log
+hs_err_pid*
+
+# APK output (built artifacts)
+*.apk
+*.aab

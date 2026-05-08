@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">网页电视</string>
+    <string name="add_site">+ 添加</string>
+    <string name="add_site_title">添加网址</string>
+    <string name="hint_url">网址 (例如 https://www.bilibili.com)</string>
+    <string name="hint_name">名称 (可选)</string>
+    <string name="action_open">打开</string>
+    <string name="action_edit">编辑</string>
+    <string name="action_delete">删除</string>
+    <string name="action_save">保存</string>
+    <string name="action_cancel">取消</string>
+    <string name="empty_hint">遥控器选中「+ 添加」开始</string>
+    <string name="invalid_url">网址无效</string>
+    <string name="tab_overview">已打开页面</string>
+    <string name="hint_back_long_press">长按返回键回到首页</string>
+</resources>
