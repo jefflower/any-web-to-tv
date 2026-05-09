@@ -67,25 +67,20 @@ class TabManager(
         tabs.add(tab)
         container.addView(v)
 
-        // Order matters:
-        //   1. Wire delegates so the session has a NavigationDelegate before any nav.
-        //   2. Open the session against the runtime.
-        //   3. Defer the real loadUri until the implicit `about:blank` finishes.
-        //      Gecko's chrome process bring-up loads about:blank as part of init,
-        //      which races with an immediate loadUri() and silently wins. We attach
-        //      a one-shot listener to PageStop to fire the real navigation only
-        //      AFTER about:blank has resolved.
-        wireDelegates(v.geckoSession, tab, deferredUrl = url)
+        // Standard Mozilla pattern: delegates → open → loadUri.
+        // Earlier I deferred the loadUri to the first about:blank PageStop callback
+        // because the URL didn't render — that diagnosis was wrong; the deferred
+        // load was probably making it worse by issuing navigation from inside a
+        // delegate callback. Going back to direct, with diagnostic logs in place.
+        wireDelegates(v.geckoSession, tab)
         v.openSession()
+        Log.d(TAG, "calling loadUri($url)")
+        v.geckoSession.loadUri(url)
         switchTo(tabs.size - 1)
         return tabs.size - 1
     }
 
-    private fun wireDelegates(session: GeckoSession, tab: Tab, deferredUrl: String? = null) {
-
-        // Once about:blank's PageStop fires, the chrome process is fully alive and we
-        // can issue the real navigation. Subsequent navigations don't hit this path.
-        var firstNavQueued = (deferredUrl == null)
+    private fun wireDelegates(session: GeckoSession, tab: Tab) {
 
         // Navigation: deep-link suppression + back-stack tracking.
         session.navigationDelegate = object : GeckoSession.NavigationDelegate {
@@ -157,14 +152,13 @@ class TabManager(
                 onProgress?.invoke(progress)
             }
 
+            override fun onPageStart(session: GeckoSession, url: String) {
+                Log.d(TAG, "PageStart uri=$url")
+            }
+
             override fun onPageStop(session: GeckoSession, success: Boolean) {
-                // Make sure the spinner clears even when title hasn't fired yet.
+                Log.d(TAG, "PageStop success=$success url=${tab.url}")
                 onProgress?.invoke(100)
-                if (!firstNavQueued && deferredUrl != null) {
-                    firstNavQueued = true
-                    Log.d(TAG, "first nav: chrome ready, loading $deferredUrl")
-                    session.load(GeckoSession.Loader().uri(deferredUrl))
-                }
             }
         }
 

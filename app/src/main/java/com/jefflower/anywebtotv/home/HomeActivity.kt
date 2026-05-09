@@ -1,10 +1,12 @@
 package com.jefflower.anywebtotv.home
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.view.View
 import android.widget.PopupMenu
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.GridLayoutManager
@@ -13,7 +15,6 @@ import com.jefflower.anywebtotv.App
 import com.jefflower.anywebtotv.R
 import com.jefflower.anywebtotv.data.Bookmark
 import com.jefflower.anywebtotv.data.FaviconLoader
-import com.jefflower.anywebtotv.web.WebActivity
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
@@ -22,6 +23,25 @@ class HomeActivity : AppCompatActivity() {
     companion object {
         const val EXTRA_FORWARD_URL = "url"
         const val EXTRA_FORWARD_TITLE = "title"
+
+        // Preferred packages (in priority order). When a bookmark is opened we
+        // pick the first one that is installed, so users with Bromite installed
+        // get the modern Chromium engine; users without it fall through to the
+        // system browser/WebView.
+        //
+        // Why these:
+        //   - org.bromite.bromite       → Bromite (Chromium 108, modern JS)
+        //   - org.mozilla.firefox       → Firefox (also GeckoView, modern JS)
+        //   - org.bromite.webview       → Bromite WebView host activity (rare)
+        // Mi TV's tvhome compliance scan whitelists these org.bromite.* /
+        // org.mozilla.* packages, so they survive while custom apps with
+        // multi-process renderers do not. Our own app is a tiny launcher
+        // (no rendering, no native services), so MIUI doesn't kill us either.
+        val PREFERRED_BROWSERS = listOf(
+            "org.bromite.bromite",
+            "org.mozilla.firefox",
+            "org.bromite.webview"
+        )
     }
 
     private lateinit var grid: RecyclerView
@@ -32,22 +52,20 @@ class HomeActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Debug / sideload entry point:
-        //   adb shell am start -n com.jefflower.anywebtotv/.home.HomeActivity --es url "http://..."
-        // Lets us launch WebActivity from outside without exporting it.
-        //
-        // CRITICAL: clear the extras after first use, otherwise if the process is
-        // restarted (Gecko memory pressure, Mi TV's process culler, etc.) the same
-        // intent fires onCreate again and re-launches WebActivity in a new instance,
-        // which produces an apparent infinite-loop of Gecko sessions.
-        intent.getStringExtra(EXTRA_FORWARD_URL)?.takeIf { it.isNotBlank() }?.let { url ->
-            val title = intent.getStringExtra(EXTRA_FORWARD_TITLE)
-            intent.removeExtra(EXTRA_FORWARD_URL)
-            intent.removeExtra(EXTRA_FORWARD_TITLE)
-            startActivity(Intent(this, WebActivity::class.java).apply {
-                putExtra(WebActivity.EXTRA_URL, url)
-                putExtra(WebActivity.EXTRA_TITLE, title)
-            })
+        // Debug / sideload entry: `adb shell am start -n .../.home.HomeActivity --es url "http://..."`.
+        // SharedPref + setIntent() guard so a process restart with the same
+        // launching intent does NOT re-fire the forward and create a loop.
+        val sp = getSharedPreferences("home_state", MODE_PRIVATE)
+        val forwardCookie = intent.getStringExtra(EXTRA_FORWARD_URL)?.takeIf { it.isNotBlank() }
+        val lastForwarded = sp.getString("last_forwarded_url", null)
+        if (forwardCookie != null && forwardCookie != lastForwarded) {
+            sp.edit().putString("last_forwarded_url", forwardCookie).apply()
+            val clean = Intent(intent).apply {
+                removeExtra(EXTRA_FORWARD_URL)
+                removeExtra(EXTRA_FORWARD_TITLE)
+            }
+            setIntent(clean)
+            launchInBrowser(forwardCookie)
         }
 
         setContentView(R.layout.activity_home)
@@ -74,10 +92,34 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun openBookmark(b: Bookmark) {
-        startActivity(Intent(this, WebActivity::class.java).apply {
-            putExtra(WebActivity.EXTRA_URL, b.url)
-            putExtra(WebActivity.EXTRA_TITLE, b.name)
-        })
+        launchInBrowser(b.url)
+    }
+
+    /**
+     * Hand off the URL to a real browser via Intent.ACTION_VIEW.
+     * Tries [PREFERRED_BROWSERS] first; falls back to the system default browser.
+     */
+    private fun launchInBrowser(url: String) {
+        val uri = Uri.parse(url)
+        for (pkg in PREFERRED_BROWSERS) {
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                setPackage(pkg)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+                return
+            }
+        }
+        // Fallback: any handler the system has (Chrome 83 system WebView via default browser).
+        val fallback = Intent(Intent.ACTION_VIEW, uri).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            startActivity(fallback)
+        } catch (_: Exception) {
+            Toast.makeText(this, "未找到可用浏览器，请安装 Bromite 或 Firefox", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun showAddDialog(existing: Bookmark?) {

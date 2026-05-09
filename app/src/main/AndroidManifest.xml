@@ -35,12 +35,5 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".web.WebActivity"
-            android:exported="false"
-            android:launchMode="singleTask"
-            android:screenOrientation="landscape"
-            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation|uiMode|locale|layoutDirection"
-            android:theme="@style/Theme.AnyWebToTv.Fullscreen" />
     </application>
 </manifest>
