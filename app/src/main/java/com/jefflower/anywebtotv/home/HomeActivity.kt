@@ -19,6 +19,11 @@ import kotlinx.coroutines.launch
 
 class HomeActivity : AppCompatActivity() {
 
+    companion object {
+        const val EXTRA_FORWARD_URL = "url"
+        const val EXTRA_FORWARD_TITLE = "title"
+    }
+
     private lateinit var grid: RecyclerView
     private lateinit var subtitle: TextView
     private lateinit var adapter: BookmarkAdapter
@@ -26,6 +31,28 @@ class HomeActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Sideload entry point: `adb shell am start -n .../.home.HomeActivity --es url "http://..."`.
+        // Useful for testing without manually adding a bookmark via remote.
+        // SharedPref + setIntent() guard so a process restart with the same intent
+        // does not re-fire the forward (would otherwise loop on Mi TV process churn).
+        val sp = getSharedPreferences("home_state", MODE_PRIVATE)
+        val forwardCookie = intent.getStringExtra(EXTRA_FORWARD_URL)?.takeIf { it.isNotBlank() }
+        val lastForwarded = sp.getString("last_forwarded_url", null)
+        if (forwardCookie != null && forwardCookie != lastForwarded) {
+            val title = intent.getStringExtra(EXTRA_FORWARD_TITLE)
+            sp.edit().putString("last_forwarded_url", forwardCookie).apply()
+            val clean = Intent(intent).apply {
+                removeExtra(EXTRA_FORWARD_URL)
+                removeExtra(EXTRA_FORWARD_TITLE)
+            }
+            setIntent(clean)
+            startActivity(Intent(this, WebActivity::class.java).apply {
+                putExtra(WebActivity.EXTRA_URL, forwardCookie)
+                putExtra(WebActivity.EXTRA_TITLE, title)
+            })
+        }
+
         setContentView(R.layout.activity_home)
 
         grid = findViewById(R.id.grid)
