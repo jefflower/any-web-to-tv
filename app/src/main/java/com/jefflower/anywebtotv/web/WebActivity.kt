@@ -90,7 +90,9 @@ class WebActivity : AppCompatActivity() {
             if (event.isTracking && !event.isCanceled) {
                 if (tabOverlay.isOpen()) { tabOverlay.hide(); return true }
                 val cur = tabManager.current()?.webView
-                if (cur != null && cur.canGoBack()) { cur.goBack(); return true }
+                // GeckoView tracks `canGoBack` asynchronously through NavigationDelegate.onCanGoBack;
+                // TvGeckoView caches the latest value so we can read it synchronously here.
+                if (cur != null && cur.canGoBack) { cur.goBack(); return true }
                 finish()
                 return true
             }
@@ -100,12 +102,12 @@ class WebActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        tabManager.current()?.webView?.onPause()
+        tabManager.current()?.webView?.setActiveSession(false)
     }
 
     override fun onResume() {
         super.onResume()
-        tabManager.current()?.webView?.onResume()
+        tabManager.current()?.webView?.setActiveSession(true)
     }
 
     override fun onDestroy() {

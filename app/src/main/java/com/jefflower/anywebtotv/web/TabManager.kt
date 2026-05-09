@@ -3,22 +3,42 @@ package com.jefflower.anywebtotv.web
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import org.mozilla.geckoview.AllowOrDeny
+import org.mozilla.geckoview.GeckoResult
+import org.mozilla.geckoview.GeckoSession
+import org.mozilla.geckoview.WebRequestError
 
+/**
+ * Multi-tab manager backed by [TvGeckoView] / [GeckoSession].
+ *
+ * Preserves all behaviors from the previous WebView implementation:
+ *   - LRU eviction at [maxTabs]
+ *   - Deep-link suppression (`baiduboxapp://`, `bilibili://`, `intent://`, ...)
+ *     so unknown URI schemes never leak the system error page
+ *   - `onTitleChanged` / `onProgress` callbacks consumed by [WebActivity] /
+ *     [TabOverlayView]
+ *
+ * Each call to [open] spawns a fresh [TvGeckoView] (and thus a new [GeckoSession]),
+ * adds it to the same [container] FrameLayout, and toggles visibility on
+ * [switchTo] — same single-container / multi-View pattern as before.
+ */
 class TabManager(
     private val ctx: Context,
     private val container: FrameLayout,
     private val maxTabs: Int = 5
 ) {
 
-    data class Tab(val webView: TvWebView, var title: String, var url: String, var lastActiveAt: Long = System.currentTimeMillis())
+    /** Per-tab state. `view` owns the [GeckoSession]; we just hold extras here. */
+    data class Tab(
+        val webView: TvGeckoView,
+        var title: String,
+        var url: String,
+        var lastActiveAt: Long = System.currentTimeMillis()
+    )
 
     private val tabs = mutableListOf<Tab>()
     private var currentIndex = -1
@@ -27,72 +47,151 @@ class TabManager(
     var onProgress: ((Int) -> Unit)? = null
 
     fun open(url: String, title: String? = null): Int {
+        Log.d(TAG, "open(url=$url, title=$title), tabs.size=${tabs.size}")
         if (tabs.size >= maxTabs) {
-            // LRU: drop the least-recently-active (excluding current)
+            // LRU: drop the least-recently-active tab (excluding the currently visible one).
             val victim = tabs.withIndex()
                 .filter { it.index != currentIndex }
                 .minByOrNull { it.value.lastActiveAt }
             if (victim != null) close(victim.index)
         }
-        val wv = TvWebView(ctx).apply {
+
+        val v = TvGeckoView(ctx).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             visibility = View.GONE
         }
-        val tab = Tab(wv, title ?: url, url)
+        val tab = Tab(v, title ?: url, url)
         tabs.add(tab)
-        container.addView(wv)
+        container.addView(v)
 
-        wv.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean =
-                handleUrl(view, request.url.toString())
-
-            @Deprecated("Required for API < 24")
-            override fun shouldOverrideUrlLoading(view: WebView, url: String): Boolean =
-                handleUrl(view, url)
-
-            override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-                // Suppress the ugly system error page for unknown-scheme main-frame nav,
-                // which can leak through on some Chromium builds despite shouldOverrideUrlLoading.
-                if (request.isForMainFrame && error.errorCode == ERROR_UNSUPPORTED_SCHEME) {
-                    view.stopLoading()
-                    return
-                }
-                super.onReceivedError(view, request, error)
-            }
-
-            override fun onPageFinished(view: WebView, finishedUrl: String) {
-                tab.url = finishedUrl
-                view.title?.let {
-                    tab.title = it
-                    onTitleChanged?.invoke(tabs.indexOf(tab), it)
-                }
-            }
-        }
-        wv.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView, newProgress: Int) {
-                onProgress?.invoke(newProgress)
-            }
-            override fun onReceivedTitle(view: WebView, t: String) {
-                tab.title = t
-                onTitleChanged?.invoke(tabs.indexOf(tab), t)
-            }
-        }
-        wv.loadUrl(url)
+        // Order matters:
+        //   1. Wire delegates so the session has a NavigationDelegate before any nav.
+        //   2. Open the session against the runtime.
+        //   3. Defer the real loadUri until the implicit `about:blank` finishes.
+        //      Gecko's chrome process bring-up loads about:blank as part of init,
+        //      which races with an immediate loadUri() and silently wins. We attach
+        //      a one-shot listener to PageStop to fire the real navigation only
+        //      AFTER about:blank has resolved.
+        wireDelegates(v.geckoSession, tab, deferredUrl = url)
+        v.openSession()
         switchTo(tabs.size - 1)
         return tabs.size - 1
     }
 
+    private fun wireDelegates(session: GeckoSession, tab: Tab, deferredUrl: String? = null) {
+
+        // Once about:blank's PageStop fires, the chrome process is fully alive and we
+        // can issue the real navigation. Subsequent navigations don't hit this path.
+        var firstNavQueued = (deferredUrl == null)
+
+        // Navigation: deep-link suppression + back-stack tracking.
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+
+            override fun onLoadRequest(
+                session: GeckoSession,
+                request: GeckoSession.NavigationDelegate.LoadRequest
+            ): GeckoResult<AllowOrDeny>? {
+                val url = request.uri
+                Log.d(TAG, "onLoadRequest(uri=$url, isRedirect=${request.isRedirect}, target=${request.target})")
+                val lower = url.lowercase()
+
+                // Allow the schemes Gecko handles natively.
+                // Returning null = "default behavior" which is the intended path; an explicit
+                // ALLOW result has been observed to behave inconsistently in some GeckoView
+                // versions when set as the very first navigation on a fresh session.
+                if (lower.startsWith("http://") || lower.startsWith("https://") ||
+                    lower.startsWith("about:") || lower.startsWith("data:") ||
+                    lower.startsWith("javascript:") || lower.startsWith("file://") ||
+                    lower.startsWith("blob:")
+                ) {
+                    return null
+                }
+
+                // Custom scheme deep links: try external app, fall back silently.
+                runCatching {
+                    val intent = if (lower.startsWith("intent://")) {
+                        Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
+                    } else {
+                        Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    }.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+
+                    if (intent.resolveActivity(ctx.packageManager) != null) {
+                        ctx.startActivity(intent)
+                    } else {
+                        intent.getStringExtra("browser_fallback_url")?.let { fallback ->
+                            session.loadUri(fallback)
+                        }
+                    }
+                }.onFailure { Log.d(TAG, "deep-link drop: $url (${it.message})") }
+
+                return GeckoResult.fromValue(AllowOrDeny.DENY)
+            }
+
+            override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
+                tab.webView.canGoBack = canGoBack
+            }
+
+            override fun onLoadError(
+                session: GeckoSession,
+                uri: String?,
+                error: WebRequestError
+            ): GeckoResult<String?>? {
+                // Returning null lets Gecko show its default error page; for unknown-scheme
+                // we already DENY in onLoadRequest so this rarely fires for schemes — but
+                // suppress the in-page error UI just in case (return empty about:blank-ish).
+                if (error.category == WebRequestError.ERROR_CATEGORY_URI &&
+                    error.code == WebRequestError.ERROR_MALFORMED_URI
+                ) {
+                    return GeckoResult.fromValue("about:blank")
+                }
+                return null
+            }
+        }
+
+        // Progress: feed the spinner in the Activity.
+        session.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onProgressChange(session: GeckoSession, progress: Int) {
+                onProgress?.invoke(progress)
+            }
+
+            override fun onPageStop(session: GeckoSession, success: Boolean) {
+                // Make sure the spinner clears even when title hasn't fired yet.
+                onProgress?.invoke(100)
+                if (!firstNavQueued && deferredUrl != null) {
+                    firstNavQueued = true
+                    Log.d(TAG, "first nav: chrome ready, loading $deferredUrl")
+                    session.load(GeckoSession.Loader().uri(deferredUrl))
+                }
+            }
+        }
+
+        // Content: title + URL drift (after redirects), feed the tab list.
+        session.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onTitleChange(session: GeckoSession, title: String?) {
+                if (!title.isNullOrBlank()) {
+                    tab.title = title
+                    onTitleChanged?.invoke(tabs.indexOf(tab), title)
+                }
+            }
+        }
+    }
+
     fun switchTo(i: Int) {
         if (i !in tabs.indices) return
-        tabs.getOrNull(currentIndex)?.webView?.visibility = View.GONE
-        tabs.getOrNull(currentIndex)?.webView?.onPause()
-        tabs[i].webView.visibility = View.VISIBLE
-        tabs[i].webView.onResume()
+        // Pause the previously visible tab — Gecko throttles inactive sessions.
+        tabs.getOrNull(currentIndex)?.webView?.let {
+            it.visibility = View.GONE
+            it.setActiveSession(false)
+        }
+        tabs[i].webView.let {
+            it.visibility = View.VISIBLE
+            it.setActiveSession(true)
+            it.requestFocus()
+        }
         tabs[i].lastActiveAt = System.currentTimeMillis()
-        tabs[i].webView.requestFocus()
         currentIndex = i
     }
 
@@ -101,8 +200,7 @@ class TabManager(
         val tab = tabs[i]
         container.removeView(tab.webView)
         tab.webView.stopLoading()
-        tab.webView.loadUrl("about:blank")
-        tab.webView.destroy()
+        tab.webView.destroyTv()
         tabs.removeAt(i)
         if (tabs.isEmpty()) {
             currentIndex = -1
@@ -112,36 +210,6 @@ class TabManager(
                          else currentIndex
             switchTo(newIdx)
         }
-    }
-
-    private fun handleUrl(view: WebView, url: String): Boolean {
-        val lower = url.lowercase()
-        // Standard schemes: let WebView load them
-        if (lower.startsWith("http://") || lower.startsWith("https://") ||
-            lower.startsWith("about:") || lower.startsWith("data:") ||
-            lower.startsWith("javascript:") || lower.startsWith("file://") ||
-            lower.startsWith("blob:")) return false
-
-        // Custom scheme (deep link, e.g. baiduboxapp://, bilibili://, weixin://, intent://)
-        // 1) Try to launch a real Android app that handles it.
-        // 2) If none, look for an intent:// fallback URL and load that in WebView.
-        // 3) Otherwise, swallow silently — never show ERR_UNKNOWN_URL_SCHEME.
-        runCatching {
-            val intent = if (lower.startsWith("intent://")) {
-                Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
-            } else {
-                Intent(Intent.ACTION_VIEW, Uri.parse(url))
-            }.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
-
-            if (intent.resolveActivity(ctx.packageManager) != null) {
-                ctx.startActivity(intent)
-            } else {
-                intent.getStringExtra("browser_fallback_url")?.let { fallback ->
-                    view.loadUrl(fallback)
-                }
-            }
-        }
-        return true
     }
 
     fun current(): Tab? = tabs.getOrNull(currentIndex)
@@ -160,9 +228,13 @@ class TabManager(
         tabs.forEach {
             container.removeView(it.webView)
             it.webView.stopLoading()
-            it.webView.destroy()
+            it.webView.destroyTv()
         }
         tabs.clear()
         currentIndex = -1
+    }
+
+    private companion object {
+        const val TAG = "TabManager"
     }
 }

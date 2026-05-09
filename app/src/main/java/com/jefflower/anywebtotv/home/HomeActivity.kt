@@ -19,6 +19,11 @@ import kotlinx.coroutines.launch
 
 class HomeActivity : AppCompatActivity() {
 
+    companion object {
+        const val EXTRA_FORWARD_URL = "url"
+        const val EXTRA_FORWARD_TITLE = "title"
+    }
+
     private lateinit var grid: RecyclerView
     private lateinit var subtitle: TextView
     private lateinit var adapter: BookmarkAdapter
@@ -26,6 +31,25 @@ class HomeActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Debug / sideload entry point:
+        //   adb shell am start -n com.jefflower.anywebtotv/.home.HomeActivity --es url "http://..."
+        // Lets us launch WebActivity from outside without exporting it.
+        //
+        // CRITICAL: clear the extras after first use, otherwise if the process is
+        // restarted (Gecko memory pressure, Mi TV's process culler, etc.) the same
+        // intent fires onCreate again and re-launches WebActivity in a new instance,
+        // which produces an apparent infinite-loop of Gecko sessions.
+        intent.getStringExtra(EXTRA_FORWARD_URL)?.takeIf { it.isNotBlank() }?.let { url ->
+            val title = intent.getStringExtra(EXTRA_FORWARD_TITLE)
+            intent.removeExtra(EXTRA_FORWARD_URL)
+            intent.removeExtra(EXTRA_FORWARD_TITLE)
+            startActivity(Intent(this, WebActivity::class.java).apply {
+                putExtra(WebActivity.EXTRA_URL, url)
+                putExtra(WebActivity.EXTRA_TITLE, title)
+            })
+        }
+
         setContentView(R.layout.activity_home)
 
         grid = findViewById(R.id.grid)
